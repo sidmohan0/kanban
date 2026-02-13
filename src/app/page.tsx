@@ -1,12 +1,13 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AdapterHealth,
   AdapterType,
   AgentDetail,
   AgentKind,
+  DatabaseSnapshotResult,
   ConnectorConfig,
   ConnectorInfo,
   ConnectorItem,
@@ -20,6 +21,7 @@ import {
   deleteProjectContextDoc,
   createProject,
   deleteConnectorItem,
+  exportDatabaseSnapshot,
   getAdapterHealth,
   getAgentDetail,
   getConnectorConfigs,
@@ -29,6 +31,7 @@ import {
   isTauriRuntime,
   listConnectors,
   listProjectContextDocs,
+  importDatabaseSnapshot,
   saveConnector,
   saveProjectContextDoc,
   restartAdapter,
@@ -156,6 +159,18 @@ function toErrorMessage(error: unknown): string {
   return "Unknown error";
 }
 
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, Math.round(bytes || 0))} B`;
+  const units = ["KB", "MB", "GB"];
+  let size = bytes / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
 function clampPollSeconds(value: number): number {
   return Math.min(MAX_POLL_SECONDS, Math.max(MIN_POLL_SECONDS, Math.round(value)));
 }
@@ -205,6 +220,9 @@ export default function Dashboard() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState<"idle" | "exporting" | "importing">("idle");
+  const [backupMessage, setBackupMessage] = useState<string | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
   const [projectDraft, setProjectDraft] = useState<ProjectDraft>(DEFAULT_PROJECT_DRAFT);
   const [projectBusy, setProjectBusy] = useState(false);
   const [projectMessage, setProjectMessage] = useState<string | null>(null);
@@ -908,6 +926,89 @@ export default function Dashboard() {
     }
     setSettingsMessage("Reset to defaults.");
   }, []);
+
+  const handleExportDatabaseSnapshot = useCallback(async () => {
+    if (!isTauri) {
+      setBackupError("Database backup is available only in desktop runtime.");
+      return;
+    }
+
+    const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
+    const selected = await save({
+      defaultPath: `kanbun-backup-${stamp}.db`,
+      filters: [{ name: "SQLite DB", extensions: ["db", "sqlite", "sqlite3"] }],
+    });
+
+    if (!selected) {
+      setBackupMessage("Export canceled.");
+      setBackupError(null);
+      return;
+    }
+
+    setBackupBusy("exporting");
+    setBackupMessage(null);
+    setBackupError(null);
+    try {
+      const result: DatabaseSnapshotResult = await exportDatabaseSnapshot(selected);
+      setBackupMessage(`Exported ${formatFileSize(result.size_bytes)} to ${result.path}.`);
+    } catch (error) {
+      setBackupError(`Export failed: ${toErrorMessage(error)}`);
+    } finally {
+      setBackupBusy("idle");
+    }
+  }, [isTauri]);
+
+  const handleImportDatabaseSnapshot = useCallback(async () => {
+    if (!isTauri) {
+      setBackupError("Database restore is available only in desktop runtime.");
+      return;
+    }
+
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "SQLite DB", extensions: ["db", "sqlite", "sqlite3"] }],
+    });
+    const sourcePath = Array.isArray(selected) ? selected[0] : selected;
+    if (!sourcePath) {
+      setBackupMessage("Import canceled.");
+      setBackupError(null);
+      return;
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm(
+        "Importing will replace current Kanbun local data (projects, workstreams, history, and settings). Continue?"
+      )
+    ) {
+      setBackupMessage("Import canceled.");
+      setBackupError(null);
+      return;
+    }
+
+    setBackupBusy("importing");
+    setBackupMessage(null);
+    setBackupError(null);
+    try {
+      const result: DatabaseSnapshotResult = await importDatabaseSnapshot(sourcePath);
+      setSelectedAgentId(null);
+      setMessagesByAgent({});
+      setAgentDetailsById({});
+      setAdapterHealthByAgent({});
+      setAdapterHealthLoadingByAgent({});
+      setAdapterRestartBusyByAgent({});
+      await Promise.all([refreshDashboard(), refreshConnectors()]);
+      if (contextProjectId) {
+        await refreshProjectContextDocs(contextProjectId);
+      }
+      setBackupMessage(`Imported ${formatFileSize(result.size_bytes)} from ${result.path}.`);
+    } catch (error) {
+      setBackupError(`Import failed: ${toErrorMessage(error)}`);
+    } finally {
+      setBackupBusy("idle");
+    }
+  }, [contextProjectId, isTauri, refreshConnectors, refreshDashboard, refreshProjectContextDocs]);
 
   const handleConnectorDraftChange = useCallback(
     (connectorType: string, patch: Partial<ConnectorDraft>) => {
@@ -1649,6 +1750,50 @@ export default function Dashboard() {
                       )}
                     </div>
                   </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid var(--border)",
+                    background: "var(--bg-card)",
+                    padding: 12,
+                  }}
+                >
+                  <p className="mn" style={{ fontSize: 10, color: "var(--dim)", marginBottom: 6 }}>
+                    DATA_BACKUP
+                  </p>
+                  <p style={{ fontSize: 13, fontWeight: 700, color: "var(--hi)", marginBottom: 8 }}>
+                    Export and import local database
+                  </p>
+                  <p className="mn" style={{ fontSize: 10, color: "var(--main)", marginBottom: 10 }}>
+                    Export saves a full local snapshot. Import replaces current local app data.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="btn-cortex"
+                      onClick={() => void handleExportDatabaseSnapshot()}
+                      disabled={!isTauri || backupBusy !== "idle"}
+                    >
+                      {backupBusy === "exporting" ? "Exporting..." : "Export DB"}
+                    </button>
+                    <button
+                      className="btn-cortex"
+                      onClick={() => void handleImportDatabaseSnapshot()}
+                      disabled={!isTauri || backupBusy !== "idle"}
+                    >
+                      {backupBusy === "importing" ? "Importing..." : "Import DB"}
+                    </button>
+                    {backupMessage && (
+                      <span className="mn" style={{ fontSize: 10, color: "var(--accent)" }}>
+                        {backupMessage}
+                      </span>
+                    )}
+                  </div>
+                  {backupError && (
+                    <p className="mn" style={{ fontSize: 10, color: "var(--err)", marginTop: 8 }}>
+                      {backupError}
+                    </p>
+                  )}
                 </div>
 
                 <div

@@ -180,6 +180,12 @@ export interface AdapterHealth {
   last_error: string | null;
 }
 
+export interface DatabaseSnapshotResult {
+  path: string;
+  size_bytes: number;
+  completed_at: string;
+}
+
 // ── Connectors ──────────────────────────────────────────────────────────────
 
 export type ConnectorType = "todoist" | "notion" | "obsidian" | "linear" | "github_issues";

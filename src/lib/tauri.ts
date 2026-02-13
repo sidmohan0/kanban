@@ -12,6 +12,7 @@ import type {
   ConversationThread,
   AdapterConfig,
   AdapterHealth,
+  DatabaseSnapshotResult,
   ConnectorInfo,
   ConnectorConfig,
   ConnectorItem,
@@ -118,6 +119,14 @@ export async function getAdapterHealth(agentId: string): Promise<AdapterHealth |
 
 export async function restartAdapter(agentId: string): Promise<AdapterHealth | null> {
   return invoke("restart_adapter", { agentId });
+}
+
+export async function exportDatabaseSnapshot(destinationPath: string): Promise<DatabaseSnapshotResult> {
+  return invoke("export_database_snapshot", { destinationPath });
+}
+
+export async function importDatabaseSnapshot(sourcePath: string): Promise<DatabaseSnapshotResult> {
+  return invoke("import_database_snapshot", { sourcePath });
 }
 
 // ── Connectors ──────────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 use crate::models::*;
 use rusqlite::{params, Connection, Result};
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub struct Database {
@@ -120,6 +122,34 @@ mod tests {
             .list_project_context_docs(&project_id)
             .expect("context docs should list after delete");
         assert!(docs_after_delete.is_empty());
+    }
+
+    #[test]
+    fn snapshot_export_import_round_trip() {
+        let source = Database::new(":memory:").expect("source db should initialize");
+        let project = Project::new("Snapshot Project", "#101010");
+        source
+            .create_project(&project)
+            .expect("project should insert");
+
+        let backup_path =
+            std::env::temp_dir().join(format!("kanbun-snapshot-{}.db", Uuid::new_v4()));
+        source
+            .export_snapshot_to_path(backup_path.to_str().expect("path should be utf-8"))
+            .expect("export should succeed");
+
+        let restored = Database::new(":memory:").expect("restored db should initialize");
+        restored
+            .import_snapshot_from_path(backup_path.to_str().expect("path should be utf-8"))
+            .expect("import should succeed");
+
+        let projects = restored.list_projects().expect("projects should list");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Snapshot Project");
+
+        let _ = std::fs::remove_file(&backup_path);
+        let _ = std::fs::remove_file(backup_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(backup_path.with_extension("db-shm"));
     }
 }
 
@@ -248,6 +278,98 @@ impl Database {
                 ON connector_items(due_at) WHERE due_at IS NOT NULL;
         ",
         )?;
+        Ok(())
+    }
+
+    pub fn export_snapshot_to_path(
+        &self,
+        destination_path: &str,
+    ) -> std::result::Result<(), String> {
+        if destination_path.trim().is_empty() {
+            return Err("destination path is empty".to_string());
+        }
+
+        let destination = Path::new(destination_path);
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "failed to create export directory {}: {}",
+                        parent.display(),
+                        error
+                    )
+                })?;
+            }
+        }
+
+        let source_conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        source_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| format!("failed to checkpoint source db: {}", error))?;
+
+        let mut destination_conn = Connection::open(destination).map_err(|error| {
+            format!(
+                "failed to open destination snapshot {}: {}",
+                destination.display(),
+                error
+            )
+        })?;
+
+        {
+            let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination_conn)
+                .map_err(|error| format!("failed to initialize database backup: {}", error))?;
+
+            backup
+                .run_to_completion(256, Duration::from_millis(20), None)
+                .map_err(|error| format!("failed to export database snapshot: {}", error))?;
+        }
+
+        destination_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
+            .map_err(|error| format!("failed to finalize destination snapshot: {}", error))?;
+
+        Ok(())
+    }
+
+    pub fn import_snapshot_from_path(&self, source_path: &str) -> std::result::Result<(), String> {
+        if source_path.trim().is_empty() {
+            return Err("source path is empty".to_string());
+        }
+
+        let source = Path::new(source_path);
+        if !source.exists() {
+            return Err(format!("backup file not found: {}", source.display()));
+        }
+
+        let source_conn = Connection::open(source).map_err(|error| {
+            format!("failed to open backup file {}: {}", source.display(), error)
+        })?;
+
+        let mut target_conn = self
+            .conn
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+
+        target_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| format!("failed to checkpoint target db: {}", error))?;
+
+        {
+            let backup = rusqlite::backup::Backup::new(&source_conn, &mut target_conn)
+                .map_err(|error| format!("failed to initialize restore operation: {}", error))?;
+
+            backup
+                .run_to_completion(256, Duration::from_millis(20), None)
+                .map_err(|error| format!("failed to import database snapshot: {}", error))?;
+        }
+
+        target_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
+            .map_err(|error| format!("failed to finalize restored database: {}", error))?;
+
         Ok(())
     }
 

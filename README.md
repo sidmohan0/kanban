@@ -21,6 +21,7 @@ Kanbun is a Tauri desktop app for managing multiple AI workstreams from one plac
 - Connector item cache in SQLite with refresh/delete flows.
 - Shared project context documents (create/edit/delete).
 - File watcher integration for workstream folders (records file-change activity).
+- Database export/import from Settings for local backup and restore.
 - Clean browser preview empty-state (obscured/blurred pane, no fake dashboard content).
 
 ### Partially built / pending
@@ -85,6 +86,8 @@ To reset local state, quit Kanbun and remove:
 - `kanbun.db`
 - `kanbun.db-wal`
 - `kanbun.db-shm`
+
+Backup and restore are also available from the app Settings view (`Export DB` / `Import DB`).
 
 ## Repo Structure
 

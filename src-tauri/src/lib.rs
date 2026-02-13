@@ -277,6 +277,8 @@ pub fn run() {
             commands::set_adapter_config,
             commands::get_adapter_health,
             commands::restart_adapter,
+            commands::export_database_snapshot,
+            commands::import_database_snapshot,
             commands::list_connectors,
             commands::save_connector,
             commands::get_connector_configs,

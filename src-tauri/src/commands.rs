@@ -47,6 +47,12 @@ fn clear_adapter_runtime(agent_id: &str) {
     }
 }
 
+fn clear_all_adapter_runtime() {
+    if let Ok(mut runtime) = adapter_runtime().lock() {
+        runtime.clear();
+    }
+}
+
 fn adapter_retry_backoff(failure_count: u32) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(5);
     Duration::from_secs((1_u64 << exponent) * 2)
@@ -765,6 +771,58 @@ pub fn restart_adapter(
         .health_check(&agent_id)
         .map(Some)
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatabaseSnapshotResult {
+    pub path: String,
+    pub size_bytes: u64,
+    pub completed_at: String,
+}
+
+#[tauri::command]
+pub fn export_database_snapshot(
+    db: State<'_, Arc<Database>>,
+    destination_path: String,
+) -> Result<DatabaseSnapshotResult, String> {
+    let destination_path = destination_path.trim();
+    if destination_path.is_empty() {
+        return Err("destination path is required".to_string());
+    }
+
+    db.export_snapshot_to_path(destination_path)?;
+    let size_bytes = std::fs::metadata(destination_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    Ok(DatabaseSnapshotResult {
+        path: destination_path.to_string(),
+        size_bytes,
+        completed_at: Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command]
+pub fn import_database_snapshot(
+    db: State<'_, Arc<Database>>,
+    source_path: String,
+) -> Result<DatabaseSnapshotResult, String> {
+    let source_path = source_path.trim();
+    if source_path.is_empty() {
+        return Err("source path is required".to_string());
+    }
+
+    db.import_snapshot_from_path(source_path)?;
+    clear_all_adapter_runtime();
+    let size_bytes = std::fs::metadata(source_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    Ok(DatabaseSnapshotResult {
+        path: source_path.to_string(),
+        size_bytes,
+        completed_at: Utc::now().to_rfc3339(),
+    })
 }
 
 // ── Connectors ──────────────────────────────────────────────────────────────
