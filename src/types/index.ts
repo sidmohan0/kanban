@@ -175,6 +175,9 @@ export interface AdapterHealth {
   session_active: boolean;
   last_heartbeat: string | null;
   details: string | null;
+  retry_after_seconds: number | null;
+  consecutive_failures: number | null;
+  last_error: string | null;
 }
 
 // ── Connectors ──────────────────────────────────────────────────────────────

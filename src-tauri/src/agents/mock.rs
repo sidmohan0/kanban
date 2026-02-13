@@ -132,6 +132,9 @@ impl Adapter for MockAdapter {
             session_active: true,
             last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
             details: Some("Mock adapter (always healthy)".to_string()),
+            retry_after_seconds: None,
+            consecutive_failures: None,
+            last_error: None,
         })
     }
 }

@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::State;
 
 use crate::agents;
@@ -7,23 +9,114 @@ use crate::connectors::{self, ConnectorConfig, ConnectorInfo, ConnectorItem};
 use crate::db::Database;
 use crate::models::*;
 
-static STARTED_ADAPTERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn started_adapters() -> &'static Mutex<HashSet<String>> {
-    STARTED_ADAPTERS.get_or_init(|| Mutex::new(HashSet::new()))
+#[derive(Debug, Clone, Default)]
+struct AdapterRuntimeState {
+    started: bool,
+    consecutive_failures: u32,
+    next_retry_at: Option<Instant>,
+    last_error: Option<String>,
+    last_failure_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-fn ensure_adapter_started(db: &Arc<Database>, agent_id: &str) -> Result<(), String> {
+impl AdapterRuntimeState {
+    fn retry_after_seconds(&self) -> Option<u64> {
+        self.next_retry_at.map(|retry_at| {
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            remaining.as_secs()
+        })
+    }
+}
+
+static ADAPTER_RUNTIME: OnceLock<Mutex<HashMap<String, AdapterRuntimeState>>> = OnceLock::new();
+
+fn adapter_runtime() -> &'static Mutex<HashMap<String, AdapterRuntimeState>> {
+    ADAPTER_RUNTIME.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn adapter_runtime_snapshot(agent_id: &str) -> Option<AdapterRuntimeState> {
+    adapter_runtime()
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.get(agent_id).cloned())
+}
+
+fn clear_adapter_runtime(agent_id: &str) {
+    if let Ok(mut runtime) = adapter_runtime().lock() {
+        runtime.remove(agent_id);
+    }
+}
+
+fn adapter_retry_backoff(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(5);
+    Duration::from_secs((1_u64 << exponent) * 2)
+}
+
+fn record_adapter_start_failure(
+    db: &Arc<Database>,
+    agent_id: &str,
+    reason: &str,
+) -> Result<String, String> {
+    let (consecutive_failures, retry_after) = {
+        let mut runtime = adapter_runtime()
+            .lock()
+            .map_err(|_| "adapter runtime lock poisoned".to_string())?;
+        let state = runtime.entry(agent_id.to_string()).or_default();
+        state.started = false;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let backoff = adapter_retry_backoff(state.consecutive_failures);
+        state.next_retry_at = Some(Instant::now() + backoff);
+        state.last_error = Some(reason.to_string());
+        state.last_failure_at = Some(Utc::now());
+        (state.consecutive_failures, backoff.as_secs())
+    };
+
+    let summary = format!(
+        "Adapter unavailable: {}. Auto-retry in {}s (attempt {}).",
+        reason, retry_after, consecutive_failures
+    );
+
+    let mut error_message = Message::from_agent(agent_id, MessageKind::Error, &summary);
+    error_message.metadata = Some(serde_json::json!({
+        "source": "adapter_supervisor",
+        "retry_after_seconds": retry_after,
+        "consecutive_failures": consecutive_failures,
+        "reason": reason,
+    }));
+    let _ = db.insert_message(&error_message);
+
+    if let Ok(Some(run)) = db.get_latest_run_for_agent(agent_id) {
+        if run.status == RunStatus::InProgress && run.ended_at.is_none() {
+            let _ = db.append_run_output(agent_id, "adapter_error", &summary);
+            if consecutive_failures >= 3 {
+                let _ = db.finalize_latest_run(
+                    agent_id,
+                    RunStatus::Failed,
+                    Some("Adapter repeatedly failed to restart".to_string()),
+                );
+            }
+        }
+    }
+
+    let _ = db.update_agent_status(agent_id, &AgentStatus::Errored);
+
+    Ok(summary)
+}
+
+fn ensure_adapter_started(db: &Arc<Database>, agent_id: &str, force: bool) -> Result<(), String> {
     let Some(config) = db.get_adapter_config(agent_id).map_err(|e| e.to_string())? else {
+        clear_adapter_runtime(agent_id);
         return Ok(());
     };
 
     let adapter = agents::create_adapter(&config);
     {
-        let mut started = started_adapters()
+        let mut runtime = adapter_runtime()
             .lock()
-            .map_err(|_| "adapter registry lock poisoned".to_string())?;
-        if started.contains(agent_id) {
+            .map_err(|_| "adapter runtime lock poisoned".to_string())?;
+        let state = runtime.entry(agent_id.to_string()).or_default();
+
+        if state.started {
             match adapter.health_check(agent_id) {
                 Ok(health) if health.connected || health.session_active => return Ok(()),
                 Ok(_) => {
@@ -31,26 +124,67 @@ fn ensure_adapter_started(db: &Arc<Database>, agent_id: &str) -> Result<(), Stri
                         "Adapter for {} was marked started but is unhealthy; restarting",
                         agent_id
                     );
-                    started.remove(agent_id);
+                    state.started = false;
+                    state.last_error =
+                        Some("health check reported disconnected adapter".to_string());
                 }
                 Err(error) => {
                     log::warn!("Adapter health check failed for {}: {}", agent_id, error);
-                    started.remove(agent_id);
+                    state.started = false;
+                    state.last_error = Some(format!("health check failed: {}", error));
+                }
+            }
+        }
+
+        if !force {
+            if let Some(retry_at) = state.next_retry_at {
+                if Instant::now() < retry_at {
+                    return Ok(());
                 }
             }
         }
     }
 
-    adapter
-        .start(agent_id, db.clone())
-        .map_err(|e| e.to_string())?;
+    match adapter.start(agent_id, db.clone()) {
+        Ok(()) => {
+            {
+                let mut runtime = adapter_runtime()
+                    .lock()
+                    .map_err(|_| "adapter runtime lock poisoned".to_string())?;
+                let state = runtime.entry(agent_id.to_string()).or_default();
+                state.started = true;
+                state.consecutive_failures = 0;
+                state.next_retry_at = None;
+                state.last_error = None;
+                state.last_failure_at = None;
+                state.last_started_at = Some(Utc::now());
+            }
 
-    let mut started = started_adapters()
-        .lock()
-        .map_err(|_| "adapter registry lock poisoned".to_string())?;
-    started.insert(agent_id.to_string());
+            if let Ok(agents) = db.list_agents() {
+                if let Some(agent) = agents.into_iter().find(|agent| agent.id == agent_id) {
+                    if agent.status == AgentStatus::Errored {
+                        let next_status = match db.get_latest_run_for_agent(agent_id) {
+                            Ok(Some(run))
+                                if run.status == RunStatus::InProgress
+                                    && run.ended_at.is_none() =>
+                            {
+                                AgentStatus::Running
+                            }
+                            _ => AgentStatus::Idle,
+                        };
+                        let _ = db.update_agent_status(agent_id, &next_status);
+                    }
+                }
+            }
 
-    Ok(())
+            Ok(())
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let summary = record_adapter_start_failure(db, agent_id, &reason)?;
+            Err(summary)
+        }
+    }
 }
 
 // ── Dashboard ───────────────────────────────────────────────────────────────
@@ -62,7 +196,7 @@ pub fn get_dashboard(db: State<'_, Arc<Database>>) -> Result<DashboardView, Stri
 
     // Ensure adapter loops are active after app restarts, even before sending a new message.
     for agent in &agents {
-        if let Err(error) = ensure_adapter_started(db.inner(), &agent.id) {
+        if let Err(error) = ensure_adapter_started(db.inner(), &agent.id, false) {
             log::warn!("Failed to start adapter for {}: {}", agent.id, error);
         }
     }
@@ -358,7 +492,7 @@ pub fn send_message(
     }
 
     // Ensure the adapter loop is running so queued messages are picked up.
-    if let Err(error) = ensure_adapter_started(db.inner(), &agent_id) {
+    if let Err(error) = ensure_adapter_started(db.inner(), &agent_id, true) {
         log::warn!("Failed to start adapter for {}: {}", agent_id, error);
     }
 
@@ -524,11 +658,9 @@ pub fn set_adapter_config(
     db.set_adapter_config(&agent_id, &config)
         .map_err(|e| e.to_string())?;
 
-    if let Ok(mut started) = started_adapters().lock() {
-        started.remove(&agent_id);
-    }
+    clear_adapter_runtime(&agent_id);
 
-    if let Err(error) = ensure_adapter_started(db.inner(), &agent_id) {
+    if let Err(error) = ensure_adapter_started(db.inner(), &agent_id, true) {
         log::warn!("Failed to start adapter for {}: {}", agent_id, error);
     }
 
@@ -547,11 +679,60 @@ pub fn get_adapter_health(
         return Ok(None);
     };
 
+    if let Err(error) = ensure_adapter_started(db.inner(), &agent_id, false) {
+        log::warn!(
+            "Failed to ensure adapter running during health check for {}: {}",
+            agent_id,
+            error
+        );
+    }
+
     let adapter = agents::create_adapter(&config);
-    adapter
-        .health_check(&agent_id)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    let mut health = match adapter.health_check(&agent_id) {
+        Ok(health) => health,
+        Err(error) => agents::AdapterHealth {
+            connected: false,
+            session_active: false,
+            last_heartbeat: None,
+            details: Some(format!("Health check failed: {}", error)),
+            retry_after_seconds: None,
+            consecutive_failures: None,
+            last_error: Some(error.to_string()),
+        },
+    };
+
+    if let Some(state) = adapter_runtime_snapshot(&agent_id) {
+        if state.consecutive_failures > 0 {
+            health.consecutive_failures = Some(state.consecutive_failures);
+        }
+
+        if let Some(retry_after) = state.retry_after_seconds() {
+            health.retry_after_seconds = Some(retry_after);
+        }
+
+        let retry_after = state.retry_after_seconds();
+        if let Some(last_error) = state.last_error.clone() {
+            let supervisor_summary = match retry_after {
+                Some(retry_after) => format!(
+                    "Supervisor: {} start failures. Next retry in {}s.",
+                    state.consecutive_failures, retry_after
+                ),
+                None => format!(
+                    "Supervisor: {} start failures recorded.",
+                    state.consecutive_failures
+                ),
+            };
+            health.last_error = Some(last_error);
+            health.details = Some(match health.details {
+                Some(details) if !details.trim().is_empty() => {
+                    format!("{}\n\n{}", supervisor_summary, details)
+                }
+                _ => supervisor_summary,
+            });
+        }
+    }
+
+    Ok(Some(health))
 }
 
 #[tauri::command]
@@ -575,11 +756,9 @@ pub fn restart_adapter(
         );
     }
 
-    if let Ok(mut started) = started_adapters().lock() {
-        started.remove(&agent_id);
-    }
+    clear_adapter_runtime(&agent_id);
 
-    ensure_adapter_started(db.inner(), &agent_id)?;
+    ensure_adapter_started(db.inner(), &agent_id, true)?;
 
     let healthy_adapter = agents::create_adapter(&config);
     healthy_adapter
@@ -715,4 +894,99 @@ pub async fn delete_connector_item(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_mock_agent() -> (Arc<Database>, String) {
+        let db = Arc::new(Database::new(":memory:").expect("in-memory db should initialize"));
+
+        let project = Project::new("Test Project", "#112233");
+        db.create_project(&project).expect("project should insert");
+
+        let agent = Agent::new(
+            "Test Agent",
+            &project.id,
+            AgentKind::Terminal,
+            "engineering",
+        );
+        db.create_agent(&agent).expect("agent should insert");
+
+        let config = AdapterConfig {
+            adapter_type: AdapterType::Mock,
+            session_name: Some("kanbun".to_string()),
+            endpoint: None,
+            command: None,
+            env: None,
+        };
+        db.set_adapter_config(&agent.id, &config)
+            .expect("adapter config should insert");
+
+        (db, agent.id)
+    }
+
+    #[test]
+    fn adapter_retry_backoff_grows_and_caps() {
+        assert_eq!(adapter_retry_backoff(1).as_secs(), 2);
+        assert_eq!(adapter_retry_backoff(2).as_secs(), 4);
+        assert_eq!(adapter_retry_backoff(3).as_secs(), 8);
+        assert_eq!(adapter_retry_backoff(4).as_secs(), 16);
+        assert_eq!(adapter_retry_backoff(5).as_secs(), 32);
+        assert_eq!(adapter_retry_backoff(6).as_secs(), 64);
+        assert_eq!(adapter_retry_backoff(20).as_secs(), 64);
+    }
+
+    #[test]
+    fn ensure_adapter_started_bootstraps_runtime_state() {
+        let (db, agent_id) = setup_mock_agent();
+        clear_adapter_runtime(&agent_id);
+
+        ensure_adapter_started(&db, &agent_id, false).expect("mock adapter should start");
+
+        let state = adapter_runtime_snapshot(&agent_id).expect("runtime state should exist");
+        assert!(state.started);
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.next_retry_at.is_none());
+        assert!(state.last_error.is_none());
+
+        clear_adapter_runtime(&agent_id);
+    }
+
+    #[test]
+    fn forced_start_bypasses_retry_cooldown() {
+        let (db, agent_id) = setup_mock_agent();
+        {
+            let mut runtime = adapter_runtime()
+                .lock()
+                .expect("runtime lock should succeed");
+            runtime.insert(
+                agent_id.clone(),
+                AdapterRuntimeState {
+                    started: false,
+                    consecutive_failures: 3,
+                    next_retry_at: Some(Instant::now() + Duration::from_secs(30)),
+                    last_error: Some("simulated failure".to_string()),
+                    last_failure_at: Some(Utc::now()),
+                    last_started_at: None,
+                },
+            );
+        }
+
+        ensure_adapter_started(&db, &agent_id, false).expect("cooldown check should not fail");
+        let cooled = adapter_runtime_snapshot(&agent_id).expect("runtime state should exist");
+        assert!(!cooled.started);
+        assert_eq!(cooled.consecutive_failures, 3);
+        assert!(cooled.retry_after_seconds().is_some());
+
+        ensure_adapter_started(&db, &agent_id, true).expect("forced start should bypass cooldown");
+        let recovered = adapter_runtime_snapshot(&agent_id).expect("runtime state should exist");
+        assert!(recovered.started);
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert!(recovered.next_retry_at.is_none());
+        assert!(recovered.last_error.is_none());
+
+        clear_adapter_runtime(&agent_id);
+    }
 }

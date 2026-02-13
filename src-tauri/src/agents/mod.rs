@@ -59,6 +59,9 @@ pub struct AdapterHealth {
     pub session_active: bool,
     pub last_heartbeat: Option<String>,
     pub details: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub consecutive_failures: Option<u32>,
+    pub last_error: Option<String>,
 }
 
 /// Create the appropriate adapter for a given config

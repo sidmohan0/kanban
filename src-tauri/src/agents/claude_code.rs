@@ -362,6 +362,9 @@ impl Adapter for ClaudeCodeAdapter {
             session_active: active,
             last_heartbeat: None, // filled by the monitor loop
             details,
+            retry_after_seconds: None,
+            consecutive_failures: None,
+            last_error: None,
         })
     }
 }

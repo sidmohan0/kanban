@@ -73,6 +73,9 @@ export function AgentDetailPanel({
   const terminalRuns = runs.filter((run) => run.status !== "in_progress").length;
   const successRate = terminalRuns > 0 ? `${((completedRuns / terminalRuns) * 100).toFixed(1)}%` : "—";
   const sendInstruction = (content: string) => onSendMessage(agent.id, "instruction", content);
+  const adapterConfigured = Boolean(adapterConfig);
+  const adapterHealthy = adapterHealth ? adapterHealth.connected || adapterHealth.session_active : false;
+  const showAdapterWarning = !adapterConfigured || (adapterHealth !== null && !adapterHealthy);
 
   return (
     <aside
@@ -190,6 +193,23 @@ export function AgentDetailPanel({
                 background: "var(--bg-panel)",
               }}
             >
+              {showAdapterWarning && (
+                <div
+                  style={{
+                    marginBottom: 8,
+                    padding: 8,
+                    border: "1px solid rgba(255, 138, 101, 0.45)",
+                    background: "rgba(255, 138, 101, 0.12)",
+                    color: "var(--main)",
+                  }}
+                >
+                  <p className="mn" style={{ fontSize: 10, margin: 0, lineHeight: 1.4 }}>
+                    {!adapterConfigured
+                      ? "No adapter configured. This workstream cannot execute instructions until configured."
+                      : "Adapter is currently unavailable. Kanbun will keep trying to recover automatically."}
+                  </p>
+                </div>
+              )}
               <ConfigRow
                 label="Connected"
                 value={
@@ -210,8 +230,19 @@ export function AgentDetailPanel({
                     : "unknown"
                 }
               />
+              {adapterHealth?.consecutive_failures !== null && adapterHealth?.consecutive_failures !== undefined && (
+                <ConfigRow label="Failures" value={`${adapterHealth.consecutive_failures}`} />
+              )}
+              {adapterHealth?.retry_after_seconds !== null && adapterHealth?.retry_after_seconds !== undefined && (
+                <ConfigRow label="Retry In" value={`${adapterHealth.retry_after_seconds}s`} />
+              )}
               {adapterHealth?.last_heartbeat && (
                 <ConfigRow label="Heartbeat" value={formatDate(adapterHealth.last_heartbeat)} />
+              )}
+              {adapterHealth?.last_error && (
+                <p className="mn" style={{ fontSize: 9, color: "#ff8a65", marginTop: 6, whiteSpace: "pre-wrap" }}>
+                  {adapterHealth.last_error}
+                </p>
               )}
               {adapterHealth?.details && (
                 <p className="mn" style={{ fontSize: 9, color: "var(--dim)", marginTop: 6, whiteSpace: "pre-wrap" }}>
