@@ -79,7 +79,7 @@ macOS bundles are produced under:
 
 Kanbun stores data in SQLite under the app data directory:
 
-- macOS: `~/Library/Application Support/com.kanbun.app/kanbun.db`
+- macOS: `~/Library/Application Support/com.kanbun.desktop/kanbun.db`
 
 To reset local state, quit Kanbun and remove:
 
@@ -88,6 +88,7 @@ To reset local state, quit Kanbun and remove:
 - `kanbun.db-shm`
 
 Backup and restore are also available from the app Settings view (`Export DB` / `Import DB`).
+If you previously ran older builds, Kanbun migrates legacy DB files from `com.kanbun.app` (and older `com.hypervisor.app`) on first launch.
 
 ## Repo Structure
 

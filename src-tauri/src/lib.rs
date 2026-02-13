@@ -27,7 +27,8 @@ fn env_flag(name: &str) -> bool {
 
 fn copy_legacy_db_files(from_dir: &Path, to_dir: &Path) -> Result<bool, String> {
     let legacy_main = from_dir.join("hypervisor.db");
-    if !legacy_main.exists() {
+    let previous_main = from_dir.join("kanbun.db");
+    if !legacy_main.exists() && !previous_main.exists() {
         return Ok(false);
     }
 
@@ -39,8 +40,14 @@ fn copy_legacy_db_files(from_dir: &Path, to_dir: &Path) -> Result<bool, String> 
         )
     })?;
 
+    let source_prefix = if previous_main.exists() {
+        "kanbun.db"
+    } else {
+        "hypervisor.db"
+    };
+
     for suffix in ["", "-wal", "-shm"] {
-        let source = from_dir.join(format!("hypervisor.db{}", suffix));
+        let source = from_dir.join(format!("{}{}", source_prefix, suffix));
         let destination = to_dir.join(format!("kanbun.db{}", suffix));
         if !source.exists() || destination.exists() {
             continue;
@@ -75,6 +82,7 @@ fn migrate_legacy_database(app_data: &Path) {
 
     let mut candidates = vec![app_data.to_path_buf()];
     if let Some(parent) = app_data.parent() {
+        candidates.push(parent.join("com.kanbun.app"));
         candidates.push(parent.join("com.hypervisor.app"));
     }
 
